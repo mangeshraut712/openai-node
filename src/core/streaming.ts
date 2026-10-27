@@ -132,6 +132,9 @@ export class Stream<Item> implements AsyncIterable<Item> {
         for await (const sse of messages) {
           if (sse.data === '[DONE]') {
             receivedCompletionSentinel = true;
+            // Mark complete before `break` so a soft-close drain/cancel failure
+            // cannot fall through to the `!done` abort in `finally` (#3050).
+            done = true;
             break;
           }
 
@@ -422,11 +425,23 @@ function createAbortableSSESource(body: NonNullable<Response['body']>, signal: A
   let cancellation: Promise<unknown> | undefined;
   let interrupt: (() => void) | undefined;
 
+  // After `[DONE]`, drain briefly so keep-alive sockets can return to the pool.
+  // Cancel only if the server keeps the response open past this budget (#3050;
+  // preserves the #2317 hang guard for proxies that never close after `[DONE]`).
+  const DRAIN_TIMEOUT_MS = 1000;
+  const DRAIN_MAX_BYTES = 64 * 1024;
+
   const waitForAbort = () =>
     // oxlint-disable-next-line promise/avoid-new -- AbortSignal callbacks need a portable Promise bridge.
     new Promise<void>((resolve) => {
       interrupt = resolve;
     });
+
+  const byteLengthOf = (value: Bytes): number => {
+    if (value == null) return 0;
+    if (typeof value === 'string') return value.length;
+    return value.byteLength;
+  };
 
   const cancel = () => {
     if (canceled || closed) {
@@ -441,6 +456,46 @@ function createAbortableSSESource(body: NonNullable<Response['body']>, signal: A
     cancellation.catch(() => undefined);
     return cancellation;
   };
+
+  /**
+   * Read and discard remaining body bytes until the stream ends, the budget is
+   * exhausted, the signal aborts, or a read fails. Returns whether the body closed.
+   */
+  const drainRemaining = async (): Promise<boolean> => {
+    if (closed || canceled || signal.aborted) {
+      return closed;
+    }
+    let total = 0;
+    const deadline = Date.now() + DRAIN_TIMEOUT_MS;
+    while (!closed && !canceled && !signal.aborted && total < DRAIN_MAX_BYTES) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        return false;
+      }
+      try {
+        const aborted = waitForAbort().then(() => null);
+        // oxlint-disable-next-line promise/avoid-new -- timeout race needs a portable Promise bridge.
+        const timedOut = new Promise<null>((resolve) => {
+          setTimeout(resolve, remaining, null);
+        });
+        const result = await Promise.race([source.next(), aborted, timedOut]);
+        if (result === null) {
+          return closed;
+        }
+        if (result.done) {
+          closed = true;
+          return true;
+        }
+        total += byteLengthOf(result.value);
+      } catch {
+        return false;
+      } finally {
+        interrupt = undefined;
+      }
+    }
+    return closed;
+  };
+
   const abort = () => {
     queueMicrotask(() => {
       interrupt?.();
@@ -473,6 +528,11 @@ function createAbortableSSESource(body: NonNullable<Response['body']>, signal: A
       }
     },
     async return() {
+      // Soft-close after a normal completion: drain briefly before cancel so undici
+      // can reuse the socket when the server ends the chunked body right after `[DONE]`.
+      if (!signal.aborted && !closed && !canceled) {
+        await drainRemaining();
+      }
       const pending = cancel();
       if (pending && !signal.aborted) {
         const aborted = waitForAbort();
@@ -480,6 +540,8 @@ function createAbortableSSESource(body: NonNullable<Response['body']>, signal: A
           if (!signal.aborted) {
             await Promise.race([pending, aborted]);
           }
+        } catch {
+          // Cancel can reject when a prior drain read already errored the stream.
         } finally {
           interrupt = undefined;
         }
@@ -507,12 +569,21 @@ function createAbortableSSESource(body: NonNullable<Response['body']>, signal: A
         cleanupError = error;
       }
       if (!closed) {
-        const pending = cancel();
-        if (pending && !failed && !signal.aborted) {
+        if (!failed && !signal.aborted && !canceled) {
           try {
-            await pending;
+            await drainRemaining();
           } catch (error) {
             cleanupError ??= error;
+          }
+        }
+        if (!closed) {
+          const pending = cancel();
+          if (pending && !failed && !signal.aborted) {
+            try {
+              await pending;
+            } catch (error) {
+              cleanupError ??= error;
+            }
           }
         }
       }

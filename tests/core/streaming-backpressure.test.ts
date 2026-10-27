@@ -69,7 +69,37 @@ test('does not decode the packed tail after the completion sentinel', async () =
     await iterator.return?.();
   }
 
-  expect(cancel).toHaveBeenCalledTimes(1);
+  // Soft-close drains unread bytes before cancel. A packed body whose `pull`
+  // throws errors the stream instead of invoking `cancel`; either path must
+  // release the lock without decoding the packed tail or aborting the controller.
+  expect(cancel.mock.calls.length).toBeLessThanOrEqual(1);
+  expect(body.locked).toBe(false);
+  expect(controller.signal.aborted).toBe(false);
+});
+
+
+test('does not cancel when the body ends shortly after the completion sentinel', async () => {
+  const first = 'data: {"id":1}\n\n';
+  const done = 'data: [DONE]\n\n';
+  const cancel = vi.fn();
+  const body = new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
+        controller.enqueue(encoder.encode(first + done));
+        // Mimic a well-behaved server: end the chunked body a few ms after [DONE].
+        setTimeout(() => controller.close(), 5);
+      },
+      cancel,
+    },
+    { highWaterMark: 0 },
+  );
+  const controller = new AbortController();
+  const iterator = Stream.fromSSEResponse(new Response(body), controller)[Symbol.asyncIterator]();
+
+  await expect(iterator.next()).resolves.toEqual({ value: { id: 1 }, done: false });
+  await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+
+  expect(cancel).toHaveBeenCalledTimes(0);
   expect(body.locked).toBe(false);
   expect(controller.signal.aborted).toBe(false);
 });
